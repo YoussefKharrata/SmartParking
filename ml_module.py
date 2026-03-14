@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+============================================================
+ Parking Intelligent — ml_module.py
+ 
+ ML basé sur le profiling RFID :
+   1. Prédiction d'occupation (RandomForest)
+   2. Détection de comportements suspects sur les badges
+      (clustering des habitudes d'accès)
+   3. Génération de données simulées si DB vide
+============================================================
+"""
+
+import sqlite3, json, time, logging, os, sys, random, signal
+from datetime import datetime, timedelta
+
+import numpy  as np
+import pandas as pd
+from sklearn.ensemble        import RandomForestClassifier, IsolationForest
+from sklearn.cluster         import KMeans
+from sklearn.preprocessing   import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics         import accuracy_score
+import joblib
+import paho.mqtt.client as mqtt
+
+DB_PATH       = "/home/pi/parking/data/parking.db"
+MODEL_DIR     = "/home/pi/parking/models"
+MQTT_BROKER   = "localhost"
+MQTT_PORT     = 1883
+RETRAIN_EVERY = 3600
+MIN_SAMPLES   = 100
+
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs("/home/pi/parking/logs", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("/home/pi/parking/logs/ml.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+log = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════
+# GÉNÉRATION DONNÉES SIMULÉES
+# ═══════════════════════════════════════════════════════════
+def generate_sensor_data(nb_jours=30):
+    log.info("Génération données simulées (%d jours)...", nb_jours)
+    records = []
+    t = datetime.now() - timedelta(days=nb_jours)
+    while t < datetime.now():
+        h   = t.hour
+        wd  = t.weekday()
+        wk  = wd >= 5
+        if   0  <= h < 6:  p = 0.02
+        elif 8  <= h < 10: p = 0.85 if not wk else 0.30
+        elif 12 <= h < 14: p = 0.80 if not wk else 0.40
+        elif 17 <= h < 19: p = 0.75 if not wk else 0.25
+        else:               p = 0.30
+        occupe = 1 if random.random() < p else 0
+        records.append({
+            "timestamp": t.isoformat(), "heure": h,
+            "minute": t.minute, "jour_semaine": wd,
+            "distance": random.uniform(3,15) if occupe else random.uniform(25,120),
+            "occupe": occupe, "porte_ouverte": occupe
+        })
+        t += timedelta(minutes=1)
+    return pd.DataFrame(records)
+
+
+def generate_rfid_data(nb_jours=30, nb_badges=10):
+    """Génère des événements RFID simulés avec des profils réalistes."""
+    records = []
+    badges  = [f"UID_{i:03d}" for i in range(nb_badges)]
+
+    # Assigner un profil à chaque badge
+    profils_badges = {}
+    for b in badges:
+        profils_badges[b] = {
+            "heures_habituelles": random.sample(range(7, 20), k=random.randint(2, 5)),
+            "jours_habituels":    random.sample(range(0, 7),  k=random.randint(3, 6)),
+            "suspect":            random.random() < 0.1,  # 10% suspects
+        }
+
+    t = datetime.now() - timedelta(days=nb_jours)
+    while t < datetime.now():
+        for badge, profil in profils_badges.items():
+            if (t.hour in profil["heures_habituelles"] and
+                t.weekday() in profil["jours_habituels"] and
+                random.random() < 0.3):
+                records.append({
+                    "timestamp":    t.isoformat(),
+                    "uid":          badge,
+                    "action":       "refuse_place_pleine" if profil["suspect"] and random.random() < 0.3 else "entree",
+                    "heure":        t.hour,
+                    "jour_semaine": t.weekday(),
+                })
+        t += timedelta(hours=1)
+    return pd.DataFrame(records)
+
+
+def injecter_donnees(df_sensor, df_rfid):
+    conn = sqlite3.connect(DB_PATH)
+    df_sensor.to_sql("sensor_data", conn, if_exists="replace", index=False)
+    df_rfid.to_sql("rfid_events",   conn, if_exists="replace", index=False)
+    conn.close()
+    log.info("Données simulées injectées.")
+
+
+# ═══════════════════════════════════════════════════════════
+# ENTRAÎNEMENT
+# ═══════════════════════════════════════════════════════════
+FEATURES = ["heure_sin","heure_cos","jour_sin","jour_cos","est_weekend","heure_pointe","minute"]
+
+def preparer_features(df):
+    df = df.copy()
+    df["heure_sin"]    = np.sin(2 * np.pi * df["heure"] / 24)
+    df["heure_cos"]    = np.cos(2 * np.pi * df["heure"] / 24)
+    df["jour_sin"]     = np.sin(2 * np.pi * df["jour_semaine"] / 7)
+    df["jour_cos"]     = np.cos(2 * np.pi * df["jour_semaine"] / 7)
+    df["est_weekend"]  = (df["jour_semaine"] >= 5).astype(int)
+    df["heure_pointe"] = df["heure"].apply(lambda h: 1 if h in [8,9,12,13,17,18] else 0)
+    return df
+
+
+def train_models():
+    conn = sqlite3.connect(DB_PATH)
+    df_sensor = pd.read_sql("SELECT * FROM sensor_data", conn)
+    df_rfid   = pd.read_sql("SELECT * FROM rfid_events", conn)
+    conn.close()
+
+    if len(df_sensor) < MIN_SAMPLES:
+        log.warning("Données insuffisantes → génération simulée...")
+        df_s = generate_sensor_data()
+        df_r = generate_rfid_data()
+        injecter_donnees(df_s, df_r)
+        conn = sqlite3.connect(DB_PATH)
+        df_sensor = pd.read_sql("SELECT * FROM sensor_data", conn)
+        df_rfid   = pd.read_sql("SELECT * FROM rfid_events", conn)
+        conn.close()
+
+    # ── Modèle 1 : Prédiction occupation ─────────────────
+    df = preparer_features(df_sensor)
+    X, y = df[FEATURES], df["occupe"]
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42)
+    m1 = RandomForestClassifier(n_estimators=100, max_depth=10,
+                                 random_state=42, class_weight="balanced")
+    m1.fit(Xtr, ytr)
+    acc = accuracy_score(yte, m1.predict(Xte))
+    log.info("Précision prédiction : %.1f%%", acc * 100)
+    joblib.dump(m1, f"{MODEL_DIR}/model_prediction.pkl")
+
+    # ── Modèle 2 : Profiling badges (clustering) ─────────
+    if len(df_rfid) >= 20:
+        # Feature par badge : heure moyenne, nb visites, nb refus, variance heure
+        stats = df_rfid.groupby("uid").agg(
+            nb_visites   = ("uid",    "count"),
+            heure_moy    = ("heure",  "mean"),
+            heure_std    = ("heure",  "std"),
+            nb_refus     = ("action", lambda x: (x == "refuse_place_pleine").sum()),
+            nb_jours_uniq= ("jour_semaine", "nunique"),
+        ).fillna(0).reset_index()
+
+        scaler   = StandardScaler()
+        features = ["nb_visites","heure_moy","heure_std","nb_refus","nb_jours_uniq"]
+        X_badges = scaler.fit_transform(stats[features])
+
+        km = KMeans(n_clusters=min(3, len(stats)), random_state=42, n_init=10)
+        stats["cluster"] = km.fit_predict(X_badges)
+
+        # Sauvegarder les clusters dans la DB
+        conn = sqlite3.connect(DB_PATH)
+        for _, row in stats.iterrows():
+            conn.execute("""
+                UPDATE rfid_profiles SET note=? WHERE uid=?
+            """, (f"cluster_{row['cluster']}", row["uid"]))
+        conn.commit()
+        conn.close()
+
+        joblib.dump({"kmeans": km, "scaler": scaler, "features": features},
+                    f"{MODEL_DIR}/model_clustering.pkl")
+        log.info("Clustering badges : %d clusters pour %d badges",
+                 km.n_clusters, len(stats))
+
+    # Isolation Forest pour anomalies capteur
+    m3 = IsolationForest(n_estimators=100, contamination=0.05, random_state=42)
+    X_norm = df[df["occupe"] == 0][["distance","heure","jour_semaine"]]
+    if len(X_norm) > 10:
+        m3.fit(X_norm)
+        joblib.dump(m3, f"{MODEL_DIR}/model_anomalie.pkl")
+
+    stats_out = {
+        "derniere_entrainement": datetime.now().isoformat(),
+        "nb_sensor": int(len(df_sensor)),
+        "nb_rfid": int(len(df_rfid)),
+        "precision": round(float(acc), 4),
+    }
+    with open(f"{MODEL_DIR}/stats.json", "w") as f:
+        json.dump(stats_out, f, indent=2)
+
+    return m1, acc
+
+
+def charger_modeles():
+    path = f"{MODEL_DIR}/model_prediction.pkl"
+    if not os.path.exists(path):
+        log.info("Modèles absents → entraînement initial...")
+        return train_models()
+    m1 = joblib.load(path)
+    log.info("Modèles chargés.")
+    return m1, None
+
+
+def predict_occupation(model, heure, minute, jour_semaine):
+    preds = []
+    for dh in range(12):
+        h = (heure + dh) % 24
+        j = (jour_semaine + (heure + dh) // 24) % 7
+        row = pd.DataFrame([{
+            "heure_sin":    np.sin(2 * np.pi * h / 24),
+            "heure_cos":    np.cos(2 * np.pi * h / 24),
+            "jour_sin":     np.sin(2 * np.pi * j / 7),
+            "jour_cos":     np.cos(2 * np.pi * j / 7),
+            "est_weekend":  1 if j >= 5 else 0,
+            "heure_pointe": 1 if h in [8,9,12,13,17,18] else 0,
+            "minute":       minute,
+        }])
+        proba = model.predict_proba(row)[0][1]
+        preds.append({"heure": h, "prob_occupe": round(float(proba), 3)})
+    return preds
+
+
+# ═══════════════════════════════════════════════════════════
+def run_ml_server():
+    log.info("=== Démarrage Module ML ===")
+    model, _ = charger_modeles()
+    dernier  = time.time()
+
+    client = mqtt.Client()
+
+    def on_connect(c, u, f, rc):
+        log.info("ML connecté MQTT")
+        c.subscribe([("parking/sensor", 0), ("parking/rfid", 0)])
+
+    def on_message(c, u, msg):
+        nonlocal model, dernier
+        try:
+            data = json.loads(msg.payload.decode())
+            now  = datetime.now()
+
+            if msg.topic == "parking/sensor":
+                preds = predict_occupation(model, now.hour, now.minute, now.weekday())
+                c.publish("parking/ml/result", json.dumps({
+                    "timestamp":   now.isoformat(),
+                    "predictions": preds,
+                }))
+
+            elif msg.topic == "parking/rfid":
+                # Analyser le profil reçu
+                profil = data.get("profil", {})
+                uid    = data.get("uid", "")
+                if profil.get("suspect"):
+                    c.publish("parking/ml/profil_alerte", json.dumps({
+                        "uid":        uid,
+                        "nb_visites": profil.get("nb_visites"),
+                        "nb_refus":   profil.get("nb_refus"),
+                        "message":    f"Badge {uid} présente un comportement anormal",
+                        "timestamp":  now.isoformat(),
+                    }))
+
+            if time.time() - dernier > RETRAIN_EVERY:
+                log.info("Re-entraînement...")
+                model, acc = train_models()
+                dernier = time.time()
+                c.publish("parking/ml/retrain", json.dumps({
+                    "timestamp": now.isoformat(), "precision": acc
+                }))
+        except Exception as e:
+            log.error("Erreur ML : %s", e)
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+
+    def stop(s, f):
+        client.disconnect(); sys.exit(0)
+    signal.signal(signal.SIGINT,  stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    log.info("ML en écoute...")
+    client.loop_forever()
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--generate-data", action="store_true")
+    p.add_argument("--train-only",    action="store_true")
+    p.add_argument("--jours", type=int, default=30)
+    args = p.parse_args()
+
+    if args.generate_data:
+        df_s = generate_sensor_data(args.jours)
+        df_r = generate_rfid_data(args.jours)
+        injecter_donnees(df_s, df_r)
+        print(f"✓ {len(df_s)} mesures capteur + {len(df_r)} événements RFID générés")
+    elif args.train_only:
+        _, acc = train_models()
+        print(f"✓ Modèles entraînés — précision: {acc:.1%}")
+    else:
+        run_ml_server()
