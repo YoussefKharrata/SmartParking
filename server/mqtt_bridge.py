@@ -1,29 +1,4 @@
 #!/usr/bin/env python3
-"""
-============================================================
- Parking Intelligent — mqtt_bridge.py
- 
- Rôle :
-   1. Lire les JSON de l'Arduino (série USB)
-   2. Faire le PROFILING des badges RFID
-   3. Décider d'ouvrir la porte → envoyer OPEN à l'Arduino
-   4. Publier tout sur MQTT
-   5. Sauvegarder dans SQLite (source pour le ML)
-
- Logique de profiling :
-   - Chaque UID est enregistré avec horodatage, fréquence,
-     heures habituelles, jours habituels
-   - Un profil se construit automatiquement au fil du temps
-   - Tout badge est accepté (parking ouvert), le profiling
-     sert à la supervision et à la détection d'anomalies ML
-
- Installation :
-   pip3 install pyserial paho-mqtt
-   
- Démarrage :
-   python3 mqtt_bridge.py
-============================================================
-"""
 
 import serial
 import json
@@ -33,21 +8,21 @@ import logging
 import signal
 import sys
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
 
 import paho.mqtt.client as mqtt
 
-# ── Configuration ─────────────────────────────────────────
-SERIAL_PORT  = "/dev/ttyUSB0"   # ou /dev/ttyACM0
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+SERIAL_PORT  = "/dev/ttyUSB0"
 SERIAL_BAUD  = 9600
 MQTT_BROKER  = "localhost"
 MQTT_PORT    = 1883
-DB_PATH      = "/home/pi/parking/data/parking.db"
-LOG_PATH     = "/home/pi/parking/logs/bridge.log"
+DB_PATH      = os.path.join(BASE_DIR, "data", "parking.db")
+LOG_PATH     = os.path.join(BASE_DIR, "logs", "bridge.log")
 
-os.makedirs("/home/pi/parking/data", exist_ok=True)
-os.makedirs("/home/pi/parking/logs", exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,17 +34,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Cache profils en mémoire (évite trop de lectures DB) ──
-profil_cache = {}  # uid → dict profil
+profil_cache = {}
 
-# ═══════════════════════════════════════════════════════════
-# BASE DE DONNÉES
-# ═══════════════════════════════════════════════════════════
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
 
-    # Données capteurs (pour ML)
     c.execute("""CREATE TABLE IF NOT EXISTS sensor_data (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp     TEXT,
@@ -81,7 +52,6 @@ def init_db():
         porte_ouverte INTEGER
     )""")
 
-    # Événements RFID bruts
     c.execute("""CREATE TABLE IF NOT EXISTS rfid_events (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp     TEXT,
@@ -92,19 +62,17 @@ def init_db():
         porte_ouverte INTEGER
     )""")
 
-    # Profils utilisateurs (construit automatiquement)
     c.execute("""CREATE TABLE IF NOT EXISTS profils (
         uid              TEXT PRIMARY KEY,
         premiere_visite  TEXT,
         derniere_visite  TEXT,
         nb_visites       INTEGER DEFAULT 0,
-        heures_frequentes TEXT,   -- JSON: {"8": 15, "17": 12, ...}
-        jours_frequents   TEXT,   -- JSON: {"0": 10, "1": 8, ...}
-        label             TEXT DEFAULT 'inconnu',  -- 'regulier','occasionnel','nouveau'
+        heures_frequentes TEXT,
+        jours_frequents   TEXT,
+        label             TEXT DEFAULT 'inconnu',
         card_type         TEXT
     )""")
 
-    # Alertes
     c.execute("""CREATE TABLE IF NOT EXISTS alertes (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp   TEXT,
@@ -118,14 +86,7 @@ def init_db():
     log.info("Base de données initialisée.")
 
 
-# ═══════════════════════════════════════════════════════════
-# PROFILING RFID
-# ═══════════════════════════════════════════════════════════
 def profiler_badge(uid: str, card_type: str, now: datetime) -> dict:
-    """
-    Met à jour le profil d'un badge RFID.
-    Retourne le profil mis à jour.
-    """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
@@ -137,7 +98,6 @@ def profiler_badge(uid: str, card_type: str, now: datetime) -> dict:
     jour  = now.weekday()
 
     if row is None:
-        # Nouveau badge → créer profil
         heures = json.dumps({str(heure): 1})
         jours  = json.dumps({str(jour): 1})
 
@@ -159,7 +119,6 @@ def profiler_badge(uid: str, card_type: str, now: datetime) -> dict:
         log.info("Nouveau badge enregistré : %s", uid)
 
     else:
-        # Badge connu → mettre à jour
         heures = json.loads(row["heures_frequentes"] or "{}")
         jours  = json.loads(row["jours_frequents"]   or "{}")
 
@@ -168,7 +127,6 @@ def profiler_badge(uid: str, card_type: str, now: datetime) -> dict:
 
         nb = row["nb_visites"] + 1
 
-        # Calculer le label selon la fréquence
         if nb >= 10:
             label = "regulier"
         elif nb >= 3:
@@ -206,7 +164,6 @@ def profiler_badge(uid: str, card_type: str, now: datetime) -> dict:
     conn.commit()
     conn.close()
 
-    # Mettre en cache
     profil_cache[uid] = profil
     return profil
 
@@ -249,11 +206,8 @@ def get_tous_profils() -> list:
     return [dict(r) for r in rows]
 
 
-# ═══════════════════════════════════════════════════════════
-# MQTT
-# ═══════════════════════════════════════════════════════════
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
         log.info("Connecté au broker MQTT")
         client.subscribe("parking/commande")
         client.publish("parking/status", json.dumps({
@@ -261,11 +215,10 @@ def on_connect(client, userdata, flags, rc):
             "timestamp": datetime.now().isoformat()
         }), retain=True)
     else:
-        log.error("Échec MQTT, code: %d", rc)
+        log.error("Échec MQTT, code: %s", reason_code)
 
 
 def on_message(client, userdata, msg):
-    """Reçoit commandes dashboard → relaie à l'Arduino."""
     try:
         payload = json.loads(msg.payload.decode())
         cmd = payload.get("commande", "")
@@ -276,35 +229,26 @@ def on_message(client, userdata, msg):
         log.error("Erreur commande : %s", e)
 
 
-# ═══════════════════════════════════════════════════════════
-# TRAITEMENT DES MESSAGES ARDUINO
-# ═══════════════════════════════════════════════════════════
 def traiter_message(data: dict, client: mqtt.Client, ser: serial.Serial):
     now      = datetime.now()
     msg_type = data.get("type", "")
     data["timestamp"] = now.isoformat()
 
-    # ── Données capteur ───────────────────────────────────
     if msg_type == "sensor":
         sauvegarder_sensor(data, now)
         client.publish("parking/sensor", json.dumps(data))
 
-    # ── Badge RFID scanné ─────────────────────────────────
     elif msg_type == "rfid":
         uid       = data.get("uid", "")
         card_type = data.get("card_type", "")
 
-        # 1. Profiler le badge
         profil = profiler_badge(uid, card_type, now)
 
-        # 2. Sauvegarder l'événement
         sauvegarder_rfid_event(uid, card_type, now.hour, now.weekday(), True)
 
-        # 3. Ouvrir la porte (tout badge → accès autorisé)
         ser.write(b"OPEN\n")
         log.info("Porte ouverte pour UID: %s (%s)", uid, profil["label"])
 
-        # 4. Publier sur MQTT pour le dashboard
         payload = {
             "timestamp": now.isoformat(),
             "uid":       uid,
@@ -314,19 +258,14 @@ def traiter_message(data: dict, client: mqtt.Client, ser: serial.Serial):
         client.publish("parking/rfid",   json.dumps(data))
         client.publish("parking/profil", json.dumps(payload))
 
-        # 5. Publier la liste complète des profils
         tous = get_tous_profils()
         client.publish("parking/profils_all", json.dumps(tous))
 
-    # ── État de la porte ──────────────────────────────────
     elif msg_type == "porte":
         client.publish("parking/porte", json.dumps(data))
         log.info("Porte : %s", data.get("etat"))
 
 
-# ═══════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════
 def main():
     log.info("=== Démarrage Parking Bridge (mode profiling) ===")
     init_db()
@@ -340,7 +279,7 @@ def main():
         log.error("Essayez : ls /dev/tty*")
         sys.exit(1)
 
-    client = mqtt.Client(userdata={"serial": ser})
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, userdata={"serial": ser})
     client.on_connect = on_connect
     client.on_message = on_message
 
