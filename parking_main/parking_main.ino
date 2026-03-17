@@ -2,34 +2,38 @@
 #include <MFRC522.h>
 #include <Servo.h>
 
-#define TRIG_PIN     9
-#define ECHO_PIN     8
-#define LED_LIBRE    6
-#define LED_OCCUPE   7
-#define RST_PIN      5
-#define SS_PIN       10
-#define SERVO_PIN    3
-
+#define NB_PLACES       6
 #define SEUIL_CM        10
 #define INTERVALLE_MS   500
 #define PORTE_OUVERTE   90
 #define PORTE_FERMEE    0
 #define DELAI_FERMETURE 5000
 
+#define RST_PIN    5
+#define SS_PIN     10
+#define SERVO_PIN  3
+#define LED_LIBRE  6
+#define LED_OCCUPE 7
+
+const uint8_t TRIG_PINS[NB_PLACES] = {A0, A1, A2, A3, A4, 9};
+const uint8_t ECHO_PINS[NB_PLACES] = {2,  4,  7,  8,  A5, 9};
+
 MFRC522 rfid(SS_PIN, RST_PIN);
 Servo   servoPorte;
 
-bool          placeOccupee   = false;
-bool          porteOuverte   = false;
-unsigned long derniereLecture = 0;
-unsigned long tempsOuverture  = 0;
+bool          places[NB_PLACES] = {false};
+bool          porteOuverte       = false;
+unsigned long derniereLecture    = 0;
+unsigned long tempsOuverture     = 0;
 
 void setup() {
   Serial.begin(9600);
   while (!Serial);
 
-  pinMode(TRIG_PIN,   OUTPUT);
-  pinMode(ECHO_PIN,   INPUT);
+  for (int i = 0; i < NB_PLACES; i++) {
+    pinMode(TRIG_PINS[i], OUTPUT);
+    pinMode(ECHO_PINS[i], INPUT);
+  }
   pinMode(LED_LIBRE,  OUTPUT);
   pinMode(LED_OCCUPE, OUTPUT);
 
@@ -48,7 +52,6 @@ void setup() {
     delay(200);
   }
   digitalWrite(LED_LIBRE, HIGH);
-
   Serial.println(F("SYSTEM:READY"));
 }
 
@@ -57,26 +60,29 @@ void loop() {
 
   if (now - derniereLecture >= INTERVALLE_MS) {
     derniereLecture = now;
-
-    float dist    = lireDistance();
-    bool  nouveau = (dist > 0 && dist < SEUIL_CM);
-
-    if (nouveau != placeOccupee) {
-      placeOccupee = nouveau;
-      if (!placeOccupee) fermerPorte();
-      mettreAJourLEDs();
+    int nbLibres = 0;
+    for (int i = 0; i < NB_PLACES; i++) {
+      float dist   = lireDistance(i);
+      bool  occupe = (dist > 0 && dist < SEUIL_CM);
+      places[i] = occupe;
+      if (!occupe) nbLibres++;
+      envoyerSensor(i, dist, occupe);
     }
-
-    envoyerSensor(dist);
+    mettreAJourLEDs(nbLibres);
   }
 
   if (porteOuverte && (millis() - tempsOuverture >= DELAI_FERMETURE)) {
     fermerPorte();
   }
 
-  if (!placeOccupee) {
+  bool auMoinsUneLibre = false;
+  for (int i = 0; i < NB_PLACES; i++) {
+    if (!places[i]) { auMoinsUneLibre = true; break; }
+  }
+
+  if (auMoinsUneLibre) {
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-      lireEtEnvoyerRFID();
+      lireEtEnvoyerRFID(auMoinsUneLibre);
       rfid.PICC_HaltA();
       rfid.PCD_StopCrypto1();
     }
@@ -90,21 +96,28 @@ void loop() {
   }
 }
 
-float lireDistance() {
-  digitalWrite(TRIG_PIN, LOW);
+float lireDistance(int idx) {
+  digitalWrite(TRIG_PINS[idx], LOW);
   delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
+  digitalWrite(TRIG_PINS[idx], HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long duree = pulseIn(ECHO_PIN, HIGH, 30000);
+  digitalWrite(TRIG_PINS[idx], LOW);
+  long duree = pulseIn(ECHO_PINS[idx], HIGH, 30000);
   if (duree == 0) return 0;
-
   float d = duree * 0.034 / 2.0;
   return (d < 2 || d > 400) ? 0 : d;
 }
 
-void lireEtEnvoyerRFID() {
+void envoyerSensor(int idx, float distance, bool occupe) {
+  Serial.print(F("{\"type\":\"sensor\""));
+  Serial.print(F(",\"place_id\":")); Serial.print(idx + 1);
+  Serial.print(F(",\"distance\":")); Serial.print(distance, 1);
+  Serial.print(F(",\"occupe\":")); Serial.print(occupe ? F("true") : F("false"));
+  Serial.print(F(",\"porte_ouverte\":")); Serial.print(porteOuverte ? F("true") : F("false"));
+  Serial.println(F("}"));
+}
+
+void lireEtEnvoyerRFID(bool placesLibres) {
   String uid = "";
   for (byte i = 0; i < rfid.uid.size; i++) {
     if (rfid.uid.uidByte[i] < 0x10) uid += "0";
@@ -112,17 +125,13 @@ void lireEtEnvoyerRFID() {
     if (i < rfid.uid.size - 1) uid += ":";
   }
   uid.toUpperCase();
-
   MFRC522::PICC_Type type = rfid.PICC_GetType(rfid.uid.sak);
   String typeStr = rfid.PICC_GetTypeName(type);
-
   Serial.print(F("{\"type\":\"rfid\""));
-  Serial.print(F(",\"uid\":\""));       Serial.print(uid);     Serial.print(F("\""));
+  Serial.print(F(",\"uid\":\"")); Serial.print(uid); Serial.print(F("\""));
   Serial.print(F(",\"card_type\":\"")); Serial.print(typeStr); Serial.print(F("\""));
-  Serial.print(F(",\"place_libre\":"));
-  Serial.print(placeOccupee ? F("false") : F("true"));
+  Serial.print(F(",\"place_libre\":")); Serial.print(placesLibres ? F("true") : F("false"));
   Serial.println(F("}"));
-
   clignoteLED(LED_LIBRE, 1, 200);
 }
 
@@ -142,17 +151,9 @@ void fermerPorte() {
   Serial.println(F("{\"type\":\"porte\",\"etat\":\"fermee\"}"));
 }
 
-void envoyerSensor(float distance) {
-  Serial.print(F("{\"type\":\"sensor\""));
-  Serial.print(F(",\"distance\":")); Serial.print(distance, 1);
-  Serial.print(F(",\"occupe\":")); Serial.print(placeOccupee ? F("true") : F("false"));
-  Serial.print(F(",\"porte_ouverte\":")); Serial.print(porteOuverte ? F("true") : F("false"));
-  Serial.println(F("}"));
-}
-
-void mettreAJourLEDs() {
-  digitalWrite(LED_LIBRE,  placeOccupee ? LOW  : HIGH);
-  digitalWrite(LED_OCCUPE, placeOccupee ? HIGH : LOW);
+void mettreAJourLEDs(int nbLibres) {
+  digitalWrite(LED_LIBRE,  nbLibres > 0 ? HIGH : LOW);
+  digitalWrite(LED_OCCUPE, nbLibres == 0 ? HIGH : LOW);
 }
 
 void clignoteLED(int pin, int fois, int delaiMs) {

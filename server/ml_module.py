@@ -12,14 +12,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics         import accuracy_score
 import joblib
 import paho.mqtt.client as mqtt
+from config import NB_PLACES, MQTT_BROKER, MQTT_PORT
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 DB_PATH       = os.path.join(BASE_DIR, "data", "parking.db")
 MODEL_DIR     = os.path.join(BASE_DIR, "models")
 DATASET_PATH  = os.path.join(BASE_DIR, "dataset.csv")
 LOG_DIR       = os.path.join(BASE_DIR, "logs")
-MQTT_BROKER   = "localhost"
-MQTT_PORT     = 1883
 RETRAIN_EVERY = 3600
 MIN_SAMPLES   = 100
 
@@ -54,30 +53,33 @@ def load_dataset_csv() -> pd.DataFrame | None:
     df["distance"]     = df["occupe"].apply(
         lambda o: random.uniform(3, 15) if o else random.uniform(25, 120)
     )
+    df["place_id"] = 1
     log.info("dataset.csv chargé : parking %s, %d lignes", top_id, len(df))
     return df
 
 
 def generate_sensor_data(nb_jours=30):
-    log.info("Génération données simulées (%d jours)...", nb_jours)
+    log.info("Génération données simulées (%d jours, %d places)...", nb_jours, NB_PLACES)
     records = []
     t = datetime.now() - timedelta(days=nb_jours)
     while t < datetime.now():
-        h   = t.hour
-        wd  = t.weekday()
-        wk  = wd >= 5
-        if   0  <= h < 6:  p = 0.02
-        elif 8  <= h < 10: p = 0.85 if not wk else 0.30
-        elif 12 <= h < 14: p = 0.80 if not wk else 0.40
-        elif 17 <= h < 19: p = 0.75 if not wk else 0.25
-        else:               p = 0.30
-        occupe = 1 if random.random() < p else 0
-        records.append({
-            "timestamp": t.isoformat(), "heure": h,
-            "minute": t.minute, "jour_semaine": wd,
-            "distance": random.uniform(3, 15) if occupe else random.uniform(25, 120),
-            "occupe": occupe, "porte_ouverte": occupe
-        })
+        h  = t.hour
+        wd = t.weekday()
+        wk = wd >= 5
+        if   0  <= h < 6:  p_base = 0.02
+        elif 8  <= h < 10: p_base = 0.85 if not wk else 0.30
+        elif 12 <= h < 14: p_base = 0.80 if not wk else 0.40
+        elif 17 <= h < 19: p_base = 0.75 if not wk else 0.25
+        else:               p_base = 0.30
+        for place_id in range(1, NB_PLACES + 1):
+            p      = min(1.0, p_base * random.uniform(0.7, 1.3))
+            occupe = 1 if random.random() < p else 0
+            records.append({
+                "timestamp": t.isoformat(), "place_id": place_id,
+                "heure": h, "minute": t.minute, "jour_semaine": wd,
+                "distance": random.uniform(3, 15) if occupe else random.uniform(25, 120),
+                "occupe": occupe, "porte_ouverte": occupe
+            })
         t += timedelta(minutes=1)
     return pd.DataFrame(records)
 
@@ -85,7 +87,6 @@ def generate_sensor_data(nb_jours=30):
 def generate_rfid_data(nb_jours=30, nb_badges=10):
     records = []
     badges  = [f"UID_{i:03d}" for i in range(nb_badges)]
-
     profils_badges = {}
     for b in badges:
         profils_badges[b] = {
@@ -93,7 +94,6 @@ def generate_rfid_data(nb_jours=30, nb_badges=10):
             "jours_habituels":    random.sample(range(0, 7),  k=random.randint(3, 6)),
             "suspect":            random.random() < 0.1,
         }
-
     t = datetime.now() - timedelta(days=nb_jours)
     while t < datetime.now():
         for badge, profil in profils_badges.items():
@@ -101,12 +101,12 @@ def generate_rfid_data(nb_jours=30, nb_badges=10):
                 t.weekday() in profil["jours_habituels"] and
                 random.random() < 0.3):
                 records.append({
-                    "timestamp":    t.isoformat(),
-                    "uid":          badge,
-                    "card_type":    "MIFARE 1KB",
-                    "action":       "refuse_place_pleine" if profil["suspect"] and random.random() < 0.3 else "entree",
-                    "heure":        t.hour,
-                    "jour_semaine": t.weekday(),
+                    "timestamp":     t.isoformat(),
+                    "uid":           badge,
+                    "card_type":     "MIFARE 1KB",
+                    "action":        "refuse_parking_plein" if profil["suspect"] and random.random() < 0.3 else "entree",
+                    "heure":         t.hour,
+                    "jour_semaine":  t.weekday(),
                     "porte_ouverte": 0 if (profil["suspect"] and random.random() < 0.3) else 1,
                 })
         t += timedelta(hours=1)
@@ -117,6 +117,7 @@ def init_db_ml(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS sensor_data (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp     TEXT,
+        place_id      INTEGER DEFAULT 1,
         heure         INTEGER,
         minute        INTEGER,
         jour_semaine  INTEGER,
@@ -197,7 +198,7 @@ def train_models():
         except Exception:
             pass
         if existing == 0:
-            df_sensor = df_csv[["heure", "minute", "jour_semaine", "distance", "occupe"]].copy()
+            df_sensor = df_csv[["place_id", "heure", "minute", "jour_semaine", "distance", "occupe"]].copy()
             df_sensor["porte_ouverte"] = df_sensor["occupe"]
             df_sensor["timestamp"]     = datetime.now().isoformat()
             df_sensor.to_sql("sensor_data", conn, if_exists="replace", index=False)
@@ -221,11 +222,13 @@ def train_models():
             conn = sqlite3.connect(DB_PATH)
             df_sensor = pd.read_sql("SELECT * FROM sensor_data", conn)
 
+    if "place_id" not in df_sensor.columns:
+        df_sensor["place_id"] = 1
+
     try:
         df_rfid = pd.read_sql("SELECT * FROM rfid_events", conn)
     except Exception:
         df_rfid = pd.DataFrame(columns=["uid", "heure", "jour_semaine", "porte_ouverte"])
-
     conn.close()
 
     df = preparer_features(df_sensor)
@@ -241,21 +244,19 @@ def train_models():
     if len(df_rfid) >= 20 and "uid" in df_rfid.columns:
         if "action" not in df_rfid.columns:
             df_rfid["action"] = df_rfid["porte_ouverte"].apply(
-                lambda v: "entree" if v else "refuse_place_pleine"
+                lambda v: "entree" if v else "refuse_parking_plein"
             )
-
         stats = df_rfid.groupby("uid").agg(
             nb_visites    = ("uid",    "count"),
             heure_moy     = ("heure",  "mean"),
             heure_std     = ("heure",  "std"),
-            nb_refus      = ("action", lambda x: (x == "refuse_place_pleine").sum()),
+            nb_refus      = ("action", lambda x: (x == "refuse_parking_plein").sum()),
             nb_jours_uniq = ("jour_semaine", "nunique"),
         ).fillna(0).reset_index()
 
         scaler   = StandardScaler()
         features = ["nb_visites", "heure_moy", "heure_std", "nb_refus", "nb_jours_uniq"]
         X_badges = scaler.fit_transform(stats[features])
-
         km = KMeans(n_clusters=min(3, len(stats)), random_state=42, n_init=10)
         stats["cluster"] = km.fit_predict(X_badges)
 
@@ -267,7 +268,6 @@ def train_models():
             )
         conn.commit()
         conn.close()
-
         joblib.dump({"kmeans": km, "scaler": scaler, "features": features},
                     f"{MODEL_DIR}/model_clustering.pkl")
         log.info("Clustering badges : %d clusters pour %d badges", km.n_clusters, len(stats))
@@ -285,6 +285,7 @@ def train_models():
         "nb_sensor": int(len(df_sensor)),
         "nb_rfid":   int(len(df_rfid)),
         "precision": round(float(acc), 4),
+        "nb_places": NB_PLACES,
         "source":    "dataset.csv" if (df_csv is not None and len(df_csv) >= MIN_SAMPLES) else "sqlite/simulated",
     }
     with open(f"{MODEL_DIR}/stats.json", "w") as f:
@@ -323,7 +324,7 @@ def predict_occupation(model, heure, minute, jour_semaine):
 
 
 def run_ml_server():
-    log.info("=== Démarrage Module ML ===")
+    log.info("=== Démarrage Module ML — %d places ===", NB_PLACES)
     model, _ = charger_modeles()
     dernier  = time.time()
 
@@ -340,9 +341,11 @@ def run_ml_server():
             now  = datetime.now()
 
             if msg.topic == "parking/sensor":
+                place_id = data.get("place_id", 1)
                 preds = predict_occupation(model, now.hour, now.minute, now.weekday())
                 c.publish("parking/ml/result", json.dumps({
                     "timestamp":   now.isoformat(),
+                    "place_id":    place_id,
                     "predictions": preds,
                 }))
 

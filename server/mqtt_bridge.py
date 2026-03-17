@@ -11,14 +11,11 @@ import os
 from datetime import datetime
 
 import paho.mqtt.client as mqtt
+from config import NB_PLACES, MQTT_BROKER, MQTT_PORT, SERIAL_PORT, SERIAL_BAUD
 
-BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
-SERIAL_PORT  = "/dev/ttyUSB0"
-SERIAL_BAUD  = 9600
-MQTT_BROKER  = "localhost"
-MQTT_PORT    = 1883
-DB_PATH      = os.path.join(BASE_DIR, "data", "parking.db")
-LOG_PATH     = os.path.join(BASE_DIR, "logs", "bridge.log")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH  = os.path.join(BASE_DIR, "data", "parking.db")
+LOG_PATH = os.path.join(BASE_DIR, "logs", "bridge.log")
 
 os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
@@ -42,6 +39,7 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS sensor_data (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp     TEXT,
+        place_id      INTEGER,
         heure         INTEGER,
         minute        INTEGER,
         jour_semaine  INTEGER,
@@ -111,33 +109,23 @@ def profiler_badge(uid: str, card_type: str, now: datetime) -> dict:
         heures[str(heure)] = heures.get(str(heure), 0) + 1
         jours[str(jour)]   = jours.get(str(jour), 0) + 1
         nb = row["nb_visites"] + 1
-        if nb >= 10:
-            label = "regulier"
-        elif nb >= 3:
-            label = "occasionnel"
-        else:
-            label = "nouveau"
+        label = "regulier" if nb >= 10 else "occasionnel" if nb >= 3 else "nouveau"
         conn.execute("""
             UPDATE profils SET
-                derniere_visite   = ?,
-                nb_visites        = ?,
-                heures_frequentes = ?,
-                jours_frequents   = ?,
-                label             = ?,
-                card_type         = ?
-            WHERE uid = ?
+                derniere_visite=?, nb_visites=?,
+                heures_frequentes=?, jours_frequents=?,
+                label=?, card_type=?
+            WHERE uid=?
         """, (now.isoformat(), nb, json.dumps(heures), json.dumps(jours), label, card_type, uid))
         profil = {
-            "uid":               uid,
-            "nb_visites":        nb,
-            "label":             label,
+            "uid": uid, "nb_visites": nb, "label": label,
             "premiere_visite":   row["premiere_visite"],
             "derniere_visite":   now.isoformat(),
             "heures_frequentes": heures,
             "jours_frequents":   jours,
-            "card_type":         card_type
+            "card_type": card_type
         }
-        log.info("Badge connu mis à jour : %s (label=%s, visites=%d)", uid, label, nb)
+        log.info("Badge mis à jour : %s (label=%s, visites=%d)", uid, label, nb)
 
     conn.commit()
     conn.close()
@@ -161,10 +149,12 @@ def sauvegarder_sensor(data, now):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         INSERT INTO sensor_data
-        (timestamp, heure, minute, jour_semaine, distance, occupe, porte_ouverte)
-        VALUES (?,?,?,?,?,?,?)
+        (timestamp, place_id, heure, minute, jour_semaine, distance, occupe, porte_ouverte)
+        VALUES (?,?,?,?,?,?,?,?)
     """, (
-        now.isoformat(), now.hour, now.minute, now.weekday(),
+        now.isoformat(),
+        data.get("place_id", 1),
+        now.hour, now.minute, now.weekday(),
         data.get("distance", 0),
         1 if data.get("occupe") else 0,
         1 if data.get("porte_ouverte") else 0,
@@ -187,6 +177,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
         client.subscribe("parking/commande")
         client.publish("parking/status", json.dumps({
             "status": "online",
+            "nb_places": NB_PLACES,
             "timestamp": datetime.now().isoformat()
         }), retain=True)
     else:
@@ -214,27 +205,27 @@ def traiter_message(data: dict, client: mqtt.Client, ser: serial.Serial):
         client.publish("parking/sensor", json.dumps(data))
 
     elif msg_type == "rfid":
-        uid       = data.get("uid", "")
-        card_type = data.get("card_type", "")
+        uid         = data.get("uid", "")
+        card_type   = data.get("card_type", "")
         place_libre = data.get("place_libre", True)
 
         profil = profiler_badge(uid, card_type, now)
 
         if not place_libre:
-            log.info("Place occupée — accès refusé pour UID: %s", uid)
+            log.info("Parking plein — accès refusé pour UID: %s", uid)
             ser.write(b"CLOSE\n")
             sauvegarder_rfid_event(uid, card_type, now.hour, now.weekday(), False)
             conn = sqlite3.connect(DB_PATH)
             conn.execute("""
                 INSERT INTO alertes (timestamp, type_alerte, description, uid)
                 VALUES (?,?,?,?)
-            """, (now.isoformat(), "refus_place_pleine",
-                  f"Badge {uid} refusé — place occupée", uid))
+            """, (now.isoformat(), "refus_parking_plein",
+                  f"Badge {uid} refusé — parking complet", uid))
             conn.commit()
             conn.close()
             client.publish("parking/alerte", json.dumps({
                 "type": "warning",
-                "message": f"Badge {uid} refusé — place occupée",
+                "message": f"Badge {uid} refusé — parking complet",
                 "timestamp": now.isoformat(),
             }))
         else:
@@ -243,10 +234,10 @@ def traiter_message(data: dict, client: mqtt.Client, ser: serial.Serial):
             sauvegarder_rfid_event(uid, card_type, now.hour, now.weekday(), True)
 
         payload = {
-            "timestamp":  now.isoformat(),
-            "uid":        uid,
-            "card_type":  card_type,
-            "profil":     profil,
+            "timestamp":   now.isoformat(),
+            "uid":         uid,
+            "card_type":   card_type,
+            "profil":      profil,
             "place_libre": place_libre,
         }
         client.publish("parking/rfid",   json.dumps(data))
@@ -259,7 +250,7 @@ def traiter_message(data: dict, client: mqtt.Client, ser: serial.Serial):
 
 
 def main():
-    log.info("=== Démarrage Parking Bridge (mode profiling) ===")
+    log.info("=== Démarrage Parking Bridge — %d places ===", NB_PLACES)
     init_db()
 
     try:
@@ -268,7 +259,6 @@ def main():
         log.info("Port série ouvert : %s", SERIAL_PORT)
     except serial.SerialException as e:
         log.error("Port série introuvable : %s", e)
-        log.error("Essayez : ls /dev/tty*")
         sys.exit(1)
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, userdata={"serial": ser})
@@ -285,8 +275,7 @@ def main():
 
     def signal_handler(sig, frame):
         log.info("Arrêt propre...")
-        client.publish("parking/status",
-                       json.dumps({"status": "offline"}), retain=True)
+        client.publish("parking/status", json.dumps({"status": "offline"}), retain=True)
         client.loop_stop()
         ser.close()
         sys.exit(0)
@@ -306,6 +295,7 @@ def main():
                     log.info("Arduino prêt !")
                     client.publish("parking/status", json.dumps({
                         "status": "arduino_ready",
+                        "nb_places": NB_PLACES,
                         "timestamp": datetime.now().isoformat()
                     }))
                     continue

@@ -13,12 +13,11 @@ from datetime import datetime
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
 import paho.mqtt.client as mqtt
+from config import NB_PLACES, MQTT_BROKER, MQTT_PORT
 
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-DB_PATH     = os.path.join(BASE_DIR, "data", "parking.db")
-MODEL_DIR   = os.path.join(BASE_DIR, "models")
-MQTT_BROKER = "localhost"
-MQTT_PORT   = 1883
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+DB_PATH   = os.path.join(BASE_DIR, "data", "parking.db")
+MODEL_DIR = os.path.join(BASE_DIR, "models")
 
 app      = Flask(__name__, template_folder="templates")
 app.config["SECRET_KEY"] = "parking-iot-2025"
@@ -28,9 +27,10 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 etat = {
-    "occupe":        False,
-    "distance":      0,
-    "porte_ouverte": False,
+    "places":        {str(i): {"occupe": False, "distance": 0, "porte_ouverte": False} for i in range(1, NB_PLACES + 1)},
+    "nb_places":     NB_PLACES,
+    "nb_libres":     NB_PLACES,
+    "nb_occupees":   0,
     "derniere_maj":  "",
     "mqtt_ok":       False,
     "arduino_ok":    False,
@@ -38,6 +38,11 @@ etat = {
     "alertes":       [],
     "predictions":   [],
 }
+
+
+def recalc_globaux():
+    etat["nb_occupees"] = sum(1 for p in etat["places"].values() if p["occupe"])
+    etat["nb_libres"]   = NB_PLACES - etat["nb_occupees"]
 
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties):
@@ -51,14 +56,24 @@ def on_mqtt_message(client, userdata, msg):
         topic = msg.topic
 
         if topic == "parking/sensor":
-            etat.update({
-                "occupe":        data.get("occupe", False),
-                "distance":      data.get("distance", 0),
-                "porte_ouverte": data.get("porte_ouverte", False),
-                "derniere_maj":  data.get("timestamp", ""),
-                "arduino_ok":    True,
+            pid = str(data.get("place_id", 1))
+            if pid in etat["places"]:
+                etat["places"][pid].update({
+                    "occupe":        data.get("occupe", False),
+                    "distance":      data.get("distance", 0),
+                    "porte_ouverte": data.get("porte_ouverte", False),
+                })
+            etat["derniere_maj"] = data.get("timestamp", "")
+            etat["arduino_ok"]   = True
+            recalc_globaux()
+            socketio.emit("sensor_update", {
+                "place_id": data.get("place_id", 1),
+                "occupe":   data.get("occupe", False),
+                "distance": data.get("distance", 0),
+                "nb_libres":   etat["nb_libres"],
+                "nb_occupees": etat["nb_occupees"],
+                "derniere_maj": etat["derniere_maj"],
             })
-            socketio.emit("sensor_update", etat)
 
         elif topic == "parking/profil":
             etat["dernier_badge"] = data
@@ -68,8 +83,10 @@ def on_mqtt_message(client, userdata, msg):
             socketio.emit("profils_update", data)
 
         elif topic == "parking/porte":
-            etat["porte_ouverte"] = data.get("etat") == "ouverte"
-            socketio.emit("porte_update", {"porte_ouverte": etat["porte_ouverte"]})
+            ouv = data.get("etat") == "ouverte"
+            for p in etat["places"].values():
+                p["porte_ouverte"] = ouv
+            socketio.emit("porte_update", {"porte_ouverte": ouv})
 
         elif topic == "parking/alerte":
             etat["alertes"].insert(0, data)
@@ -82,11 +99,11 @@ def on_mqtt_message(client, userdata, msg):
 
         elif topic == "parking/ml/profil_alerte":
             alerte = {
-                "type":      "danger",
-                "message":   data.get("message", f"Badge suspect : {data.get('uid','')}"),
-                "uid":       data.get("uid", ""),
+                "type":       "danger",
+                "message":    data.get("message", f"Badge suspect : {data.get('uid','')}"),
+                "uid":        data.get("uid", ""),
                 "nb_visites": data.get("nb_visites"),
-                "timestamp": data.get("timestamp", datetime.now().isoformat()),
+                "timestamp":  data.get("timestamp", datetime.now().isoformat()),
             }
             etat["alertes"].insert(0, alerte)
             etat["alertes"] = etat["alertes"][:50]
@@ -116,14 +133,17 @@ def api_etat():
     return jsonify(etat)
 
 
+@app.route("/api/config")
+def api_config():
+    return jsonify({"nb_places": NB_PLACES})
+
+
 @app.route("/api/profils")
 def api_profils():
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM profils ORDER BY nb_visites DESC"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM profils ORDER BY nb_visites DESC").fetchall()
         conn.close()
         return jsonify([dict(r) for r in rows])
     except Exception as e:
@@ -135,9 +155,7 @@ def api_profil_detail(uid):
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-        profil = conn.execute(
-            "SELECT * FROM profils WHERE uid = ?", (uid,)
-        ).fetchone()
+        profil = conn.execute("SELECT * FROM profils WHERE uid = ?", (uid,)).fetchone()
         historique = conn.execute("""
             SELECT timestamp, heure, jour_semaine
             FROM rfid_events WHERE uid = ?
@@ -146,10 +164,7 @@ def api_profil_detail(uid):
         conn.close()
         if not profil:
             return jsonify({"error": "UID non trouvé"}), 404
-        return jsonify({
-            "profil":     dict(profil),
-            "historique": [dict(r) for r in historique]
-        })
+        return jsonify({"profil": dict(profil), "historique": [dict(r) for r in historique]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -193,6 +208,12 @@ def api_stats():
                 {"heure": r[0], "nb": r[1]}
                 for r in conn.execute(
                     "SELECT heure, COUNT(*) FROM rfid_events GROUP BY heure ORDER BY heure"
+                ).fetchall()
+            ],
+            "occupation_par_place": [
+                {"place_id": r[0], "taux": round(r[1]*100, 1)}
+                for r in conn.execute(
+                    "SELECT place_id, AVG(occupe) FROM sensor_data GROUP BY place_id ORDER BY place_id"
                 ).fetchall()
             ],
         }
@@ -241,5 +262,5 @@ def api_commande():
 
 
 if __name__ == "__main__":
-    log.info("Dashboard sur http://0.0.0.0:5000")
+    log.info("Dashboard sur http://0.0.0.0:5000 — %d places", NB_PLACES)
     socketio.run(app, host="0.0.0.0", port=5000, debug=False)

@@ -6,9 +6,10 @@ import random
 import sys
 from datetime import datetime
 import paho.mqtt.client as mqtt
+from config import NB_PLACES, MQTT_BROKER, MQTT_PORT
 
-MQTT_BROKER = "localhost"
-MQTT_PORT   = 1883
+places_etat = {i: False for i in range(1, NB_PLACES + 1)}
+
 
 def on_commande(client, userdata, msg):
     try:
@@ -20,6 +21,7 @@ def on_commande(client, userdata, msg):
             send_porte("fermee")
     except Exception:
         pass
+
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_message = on_commande
@@ -35,23 +37,24 @@ RFID_CARDS = [
     ("DE:AD:BE:EF", "MIFARE 1KB"),
 ]
 
-place_occupee = False
-
 
 def pub(topic, payload):
     client.publish(topic, json.dumps(payload))
     print(f"  >> {topic} : {json.dumps(payload)}")
 
 
-def send_sensor(occupe=None, distance=None):
-    global place_occupee
+def send_sensor(place_id=None, occupe=None, distance=None):
+    global places_etat
+    if place_id is None:
+        place_id = random.randint(1, NB_PLACES)
     if occupe is None:
-        occupe = place_occupee
+        occupe = places_etat[place_id]
     if distance is None:
         distance = round(random.uniform(3, 12), 1) if occupe else round(random.uniform(30, 100), 1)
-    place_occupee = occupe
+    places_etat[place_id] = occupe
     pub("parking/sensor", {
         "type":          "sensor",
+        "place_id":      place_id,
         "distance":      distance,
         "occupe":        occupe,
         "porte_ouverte": False,
@@ -59,7 +62,14 @@ def send_sensor(occupe=None, distance=None):
     })
 
 
+def send_all_sensors():
+    for pid in range(1, NB_PLACES + 1):
+        send_sensor(place_id=pid)
+        time.sleep(0.05)
+
+
 RFID_VISIT_COUNTS = {}
+
 
 def send_rfid(uid=None, card_type=None):
     global RFID_VISIT_COUNTS
@@ -69,13 +79,9 @@ def send_rfid(uid=None, card_type=None):
 
     RFID_VISIT_COUNTS[uid] = RFID_VISIT_COUNTS.get(uid, 0) + 1
     nb = RFID_VISIT_COUNTS[uid]
+    label = "regulier" if nb >= 10 else "occasionnel" if nb >= 3 else "nouveau"
 
-    if nb >= 10:
-        label = "regulier"
-    elif nb >= 3:
-        label = "occasionnel"
-    else:
-        label = "nouveau"
+    place_libre = any(not v for v in places_etat.values())
 
     profil = {
         "uid":               uid,
@@ -92,7 +98,7 @@ def send_rfid(uid=None, card_type=None):
         "type":        "rfid",
         "uid":         uid,
         "card_type":   card_type,
-        "place_libre": not place_occupee,
+        "place_libre": place_libre,
         "timestamp":   now.isoformat(),
     })
     pub("parking/profil", {
@@ -111,13 +117,13 @@ def send_rfid(uid=None, card_type=None):
         for u, v in RFID_VISIT_COUNTS.items()
     ))
 
-    if place_occupee:
+    if not place_libre:
         pub("parking/alerte", {
             "type":      "warning",
-            "message":   f"Badge {uid} refusé — place occupée",
+            "message":   f"Badge {uid} refusé — parking complet",
             "timestamp": now.isoformat(),
         })
-        print(f"  !! Refus enregistré pour {uid}")
+        print(f"  !! Parking complet — refus pour {uid}")
     else:
         time.sleep(0.3)
         send_porte("ouverte")
@@ -144,7 +150,7 @@ def send_alerte(msg):
 def auto_loop():
     print("Mode automatique — Ctrl+C pour arrêter\n")
     while True:
-        send_sensor()
+        send_all_sensors()
 
         if random.random() < 0.15:
             send_rfid()
@@ -156,16 +162,19 @@ def auto_loop():
 
 
 def manual_loop():
-    print("Mode manuel — commandes disponibles :")
-    print("  s        envoyer sensor (état actuel)")
-    print("  s0       sensor place libre")
-    print("  s1       sensor place occupée")
-    print("  r        badge RFID aléatoire")
-    print("  r <uid>  badge RFID avec UID précis")
-    print("  o        porte ouverte")
-    print("  f        porte fermée")
-    print("  a <msg>  alerte manuelle")
-    print("  q        quitter\n")
+    print(f"Mode manuel — {NB_PLACES} places configurées")
+    print("Commandes disponibles :")
+    print("  s              tous les sensors (état actuel)")
+    print("  s<N>           sensor place N (ex: s1)")
+    print("  s<N>0          place N libre  (ex: s10)")
+    print("  s<N>1          place N occupée (ex: s11)")
+    print("  r              badge RFID aléatoire")
+    print("  r <uid>        badge RFID avec UID précis")
+    print("  o              porte ouverte")
+    print("  f              porte fermée")
+    print("  a <msg>        alerte manuelle")
+    print("  etat           afficher état toutes les places")
+    print("  q              quitter\n")
 
     while True:
         try:
@@ -182,12 +191,28 @@ def manual_loop():
 
         if cmd == "q":
             break
+        elif cmd == "etat":
+            for pid, occ in places_etat.items():
+                print(f"  Place {pid}: {'OCCUPÉE' if occ else 'LIBRE'}")
         elif cmd == "s":
-            send_sensor()
-        elif cmd == "s0":
-            send_sensor(occupe=False)
-        elif cmd == "s1":
-            send_sensor(occupe=True)
+            send_all_sensors()
+        elif cmd.startswith("s") and len(cmd) >= 2:
+            try:
+                if cmd[-1] in ("0", "1"):
+                    pid   = int(cmd[1:-1])
+                    occup = cmd[-1] == "1"
+                    if 1 <= pid <= NB_PLACES:
+                        send_sensor(place_id=pid, occupe=occup)
+                    else:
+                        print(f"  Place invalide (1-{NB_PLACES})")
+                else:
+                    pid = int(cmd[1:])
+                    if 1 <= pid <= NB_PLACES:
+                        send_sensor(place_id=pid)
+                    else:
+                        print(f"  Place invalide (1-{NB_PLACES})")
+            except ValueError:
+                print("  commande inconnue")
         elif cmd == "r":
             if arg:
                 send_rfid(uid=arg.upper(), card_type="MIFARE 1KB")
@@ -208,10 +233,10 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--auto":
         mode = "auto"
 
-    print(f"Simulation Arduino — mode {'automatique' if mode == 'auto' else 'manuel'}")
+    print(f"Simulation Arduino — {NB_PLACES} places — mode {'automatique' if mode == 'auto' else 'manuel'}")
     print(f"Broker : {MQTT_BROKER}:{MQTT_PORT}\n")
 
-    send_sensor(occupe=False, distance=85.0)
+    send_all_sensors()
     time.sleep(0.5)
 
     try:
