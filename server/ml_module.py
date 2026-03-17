@@ -103,18 +103,69 @@ def generate_rfid_data(nb_jours=30, nb_badges=10):
                 records.append({
                     "timestamp":    t.isoformat(),
                     "uid":          badge,
+                    "card_type":    "MIFARE 1KB",
                     "action":       "refuse_place_pleine" if profil["suspect"] and random.random() < 0.3 else "entree",
                     "heure":        t.hour,
                     "jour_semaine": t.weekday(),
+                    "porte_ouverte": 0 if (profil["suspect"] and random.random() < 0.3) else 1,
                 })
         t += timedelta(hours=1)
     return pd.DataFrame(records)
 
 
+def init_db_ml(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS sensor_data (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp     TEXT,
+        heure         INTEGER,
+        minute        INTEGER,
+        jour_semaine  INTEGER,
+        distance      REAL,
+        occupe        INTEGER,
+        porte_ouverte INTEGER
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS rfid_events (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp     TEXT,
+        uid           TEXT,
+        card_type     TEXT,
+        heure         INTEGER,
+        jour_semaine  INTEGER,
+        porte_ouverte INTEGER
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS profils (
+        uid               TEXT PRIMARY KEY,
+        premiere_visite   TEXT,
+        derniere_visite   TEXT,
+        nb_visites        INTEGER DEFAULT 0,
+        heures_frequentes TEXT,
+        jours_frequents   TEXT,
+        label             TEXT DEFAULT 'inconnu',
+        card_type         TEXT
+    )""")
+    conn.commit()
+
+
 def injecter_donnees(df_sensor, df_rfid):
     conn = sqlite3.connect(DB_PATH)
+    init_db_ml(conn)
     df_sensor.to_sql("sensor_data", conn, if_exists="replace", index=False)
-    df_rfid.to_sql("rfid_events",   conn, if_exists="replace", index=False)
+    df_rfid[["timestamp", "uid", "card_type", "heure", "jour_semaine", "porte_ouverte"]].to_sql(
+        "rfid_events", conn, if_exists="replace", index=False
+    )
+    now = datetime.now().isoformat()
+    for uid, grp in df_rfid.groupby("uid"):
+        nb     = len(grp)
+        heures = json.dumps(grp["heure"].value_counts().to_dict())
+        jours  = json.dumps(grp["jour_semaine"].value_counts().to_dict())
+        label  = "regulier" if nb >= 10 else "occasionnel" if nb >= 3 else "nouveau"
+        conn.execute("""
+            INSERT OR REPLACE INTO profils
+            (uid, premiere_visite, derniere_visite, nb_visites,
+             heures_frequentes, jours_frequents, label, card_type)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (uid, now, now, nb, heures, jours, label, "MIFARE 1KB"))
+    conn.commit()
     conn.close()
     log.info("Données injectées.")
 
@@ -136,46 +187,45 @@ def preparer_features(df):
 def train_models():
     df_csv = load_dataset_csv()
 
+    conn = sqlite3.connect(DB_PATH)
+    init_db_ml(conn)
+
     if df_csv is not None and len(df_csv) >= MIN_SAMPLES:
-        df_sensor = df_csv[["heure", "minute", "jour_semaine", "distance", "occupe"]].copy()
-        df_sensor["porte_ouverte"] = df_sensor["occupe"]
-        df_sensor["timestamp"]     = datetime.now().isoformat()
-        conn = sqlite3.connect(DB_PATH)
         existing = 0
         try:
             existing = conn.execute("SELECT COUNT(*) FROM sensor_data").fetchone()[0]
         except Exception:
             pass
         if existing == 0:
+            df_sensor = df_csv[["heure", "minute", "jour_semaine", "distance", "occupe"]].copy()
+            df_sensor["porte_ouverte"] = df_sensor["occupe"]
+            df_sensor["timestamp"]     = datetime.now().isoformat()
             df_sensor.to_sql("sensor_data", conn, if_exists="replace", index=False)
             conn.commit()
             log.info("Entraînement depuis dataset.csv (%d lignes)", len(df_sensor))
         else:
             log.info("Entraînement depuis SQLite (%d lignes réelles)", existing)
-            df_sensor = pd.read_sql("SELECT * FROM sensor_data", conn)
-        conn.close()
+        df_sensor = pd.read_sql("SELECT * FROM sensor_data", conn)
     else:
-        conn = sqlite3.connect(DB_PATH)
         try:
             df_sensor = pd.read_sql("SELECT * FROM sensor_data", conn)
         except Exception:
             df_sensor = pd.DataFrame()
-        conn.close()
 
         if len(df_sensor) < MIN_SAMPLES:
             log.warning("Données insuffisantes — génération simulée...")
+            conn.close()
             df_s = generate_sensor_data()
             df_r = generate_rfid_data()
             injecter_donnees(df_s, df_r)
             conn = sqlite3.connect(DB_PATH)
             df_sensor = pd.read_sql("SELECT * FROM sensor_data", conn)
-            conn.close()
 
-    conn = sqlite3.connect(DB_PATH)
     try:
         df_rfid = pd.read_sql("SELECT * FROM rfid_events", conn)
     except Exception:
-        df_rfid = pd.DataFrame(columns=["uid", "heure", "jour_semaine", "action"])
+        df_rfid = pd.DataFrame(columns=["uid", "heure", "jour_semaine", "porte_ouverte"])
+
     conn.close()
 
     df = preparer_features(df_sensor)
@@ -188,7 +238,12 @@ def train_models():
     log.info("Précision prédiction : %.1f%%", acc * 100)
     joblib.dump(m1, f"{MODEL_DIR}/model_prediction.pkl")
 
-    if len(df_rfid) >= 20:
+    if len(df_rfid) >= 20 and "uid" in df_rfid.columns:
+        if "action" not in df_rfid.columns:
+            df_rfid["action"] = df_rfid["porte_ouverte"].apply(
+                lambda v: "entree" if v else "refuse_place_pleine"
+            )
+
         stats = df_rfid.groupby("uid").agg(
             nb_visites    = ("uid",    "count"),
             heure_moy     = ("heure",  "mean"),
@@ -215,8 +270,9 @@ def train_models():
 
         joblib.dump({"kmeans": km, "scaler": scaler, "features": features},
                     f"{MODEL_DIR}/model_clustering.pkl")
-        log.info("Clustering badges : %d clusters pour %d badges",
-                 km.n_clusters, len(stats))
+        log.info("Clustering badges : %d clusters pour %d badges", km.n_clusters, len(stats))
+    else:
+        log.info("KMeans ignoré : %d événements RFID (minimum 20)", len(df_rfid))
 
     m3 = IsolationForest(n_estimators=100, contamination=0.05, random_state=42)
     X_norm = df[df["occupe"] == 0][["distance", "heure", "jour_semaine"]]

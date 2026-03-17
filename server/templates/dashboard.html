@@ -215,19 +215,68 @@ header {
 }
 .alerte-ts { font-family: var(--mono); font-size: .7rem; color: var(--dim); white-space: nowrap; }
 
-.pred-row {
-  display: flex; gap: 5px; align-items: flex-end;
-  height: 70px; margin-top: 10px;
+/* ── Prédictions ML redessinées ── */
+.pred-wrap {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
-.pred-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; }
-.pred-bar {
-  width: 100%; border-radius: 3px 3px 0 0; min-height: 3px;
-  transition: height .6s ease;
+
+.pred-item {
+  display: grid;
+  grid-template-columns: 32px 1fr 38px;
+  align-items: center;
+  gap: 8px;
 }
-.pred-bar.hi { background: var(--red);    box-shadow: 0 0 5px var(--red); }
-.pred-bar.md { background: var(--orange); }
-.pred-bar.lo { background: var(--green); }
-.pred-h { font-size: .6rem; color: var(--dim); }
+
+.pred-heure {
+  font-family: var(--mono);
+  font-size: .7rem;
+  color: var(--dim);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.pred-track {
+  height: 14px;
+  background: rgba(22,34,54,.9);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+
+.pred-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width .7s cubic-bezier(.4,0,.2,1);
+  position: relative;
+}
+
+.pred-fill.lo {
+  background: linear-gradient(90deg, rgba(0,230,118,.5), var(--green));
+  box-shadow: 0 0 6px rgba(0,230,118,.3);
+}
+.pred-fill.md {
+  background: linear-gradient(90deg, rgba(255,109,0,.5), var(--orange));
+  box-shadow: 0 0 6px rgba(255,109,0,.3);
+}
+.pred-fill.hi {
+  background: linear-gradient(90deg, rgba(255,23,68,.5), var(--red));
+  box-shadow: 0 0 8px rgba(255,23,68,.4);
+}
+
+.pred-pct {
+  font-family: var(--mono);
+  font-size: .7rem;
+  text-align: right;
+  white-space: nowrap;
+}
+.pred-pct.lo { color: var(--green); }
+.pred-pct.md { color: var(--orange); }
+.pred-pct.hi { color: var(--red); }
+
+/* ── fin prédictions ── */
 
 .modal-overlay {
   position: fixed; inset: 0; z-index: 1000;
@@ -324,7 +373,7 @@ header {
     <div class="card span2">
       <div class="card-accent gold"></div>
       <div class="card-title">Prédictions occupation — 12h</div>
-      <div class="pred-row" id="pred-row">
+      <div id="pred-wrap" class="pred-wrap">
         <div style="color:var(--dim);font-size:.78rem">En attente du module ML...</div>
       </div>
     </div>
@@ -498,18 +547,23 @@ socket.on('profils_update', profils => {
 
 socket.on('ml_update', d => {
   const preds = d.predictions || [];
-  const row   = document.getElementById('pred-row');
+  const wrap  = document.getElementById('pred-wrap');
   if (!preds.length) return;
-  row.innerHTML = '';
-  preds.forEach(p => {
+
+  wrap.innerHTML = preds.map(p => {
     const pct = Math.round(p.prob_occupe * 100);
     const cls = pct > 70 ? 'hi' : pct > 40 ? 'md' : 'lo';
-    row.innerHTML += `
-      <div class="pred-col">
-        <div class="pred-bar ${cls}" style="height:${pct}%"></div>
-        <div class="pred-h">${p.heure}h</div>
+    const now = new Date().getHours();
+    const isCurrent = p.heure === now;
+    return `
+      <div class="pred-item" style="${isCurrent ? 'opacity:1' : 'opacity:.75'}">
+        <div class="pred-heure" style="${isCurrent ? 'color:var(--blue)' : ''}">${p.heure}h</div>
+        <div class="pred-track">
+          <div class="pred-fill ${cls}" style="width:${pct}%"></div>
+        </div>
+        <div class="pred-pct ${cls}">${pct}%</div>
       </div>`;
-  });
+  }).join('');
 });
 
 socket.on('nouvelle_alerte', a => {
@@ -747,6 +801,28 @@ function cmd(c) {
 }
 
 chargerStats();
+
+async function chargerPredictionsInitiales() {
+  const r = await fetch('/api/predictions');
+  const d = await r.json();
+  if (d.predictions && d.predictions.length) {
+    const wrap = document.getElementById('pred-wrap');
+    wrap.innerHTML = d.predictions.map(p => {
+      const pct = Math.round(p.prob_occupe * 100);
+      const cls = pct > 70 ? 'hi' : pct > 40 ? 'md' : 'lo';
+      const isCurrent = p.heure === new Date().getHours();
+      return `
+        <div class="pred-item" style="${isCurrent ? 'opacity:1' : 'opacity:.75'}">
+          <div class="pred-heure" style="${isCurrent ? 'color:var(--blue)' : ''}">${p.heure}h</div>
+          <div class="pred-track">
+            <div class="pred-fill ${cls}" style="width:${pct}%"></div>
+          </div>
+          <div class="pred-pct ${cls}">${pct}%</div>
+        </div>`;
+    }).join('');
+  }
+}
+chargerPredictionsInitiales();
 </script>
 </body>
 </html>

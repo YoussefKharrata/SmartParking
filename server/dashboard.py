@@ -5,6 +5,9 @@ import sqlite3
 import threading
 import logging
 import os
+import numpy as np
+import pandas as pd
+import joblib
 from datetime import datetime
 
 from flask import Flask, render_template, jsonify, request
@@ -13,6 +16,7 @@ import paho.mqtt.client as mqtt
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 DB_PATH     = os.path.join(BASE_DIR, "data", "parking.db")
+MODEL_DIR   = os.path.join(BASE_DIR, "models")
 MQTT_BROKER = "localhost"
 MQTT_PORT   = 1883
 
@@ -76,6 +80,18 @@ def on_mqtt_message(client, userdata, msg):
             etat["predictions"] = data.get("predictions", [])
             socketio.emit("ml_update", data)
 
+        elif topic == "parking/ml/profil_alerte":
+            alerte = {
+                "type":      "danger",
+                "message":   data.get("message", f"Badge suspect : {data.get('uid','')}"),
+                "uid":       data.get("uid", ""),
+                "nb_visites": data.get("nb_visites"),
+                "timestamp": data.get("timestamp", datetime.now().isoformat()),
+            }
+            etat["alertes"].insert(0, alerte)
+            etat["alertes"] = etat["alertes"][:50]
+            socketio.emit("nouvelle_alerte", alerte)
+
     except Exception as e:
         log.error("MQTT message error: %s", e)
 
@@ -119,21 +135,17 @@ def api_profil_detail(uid):
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-
         profil = conn.execute(
             "SELECT * FROM profils WHERE uid = ?", (uid,)
         ).fetchone()
-
         historique = conn.execute("""
             SELECT timestamp, heure, jour_semaine
             FROM rfid_events WHERE uid = ?
             ORDER BY timestamp DESC LIMIT 50
         """, (uid,)).fetchall()
-
         conn.close()
         if not profil:
             return jsonify({"error": "UID non trouvé"}), 404
-
         return jsonify({
             "profil":     dict(profil),
             "historique": [dict(r) for r in historique]
@@ -164,14 +176,13 @@ def api_rfid():
 def api_stats():
     try:
         conn = sqlite3.connect(DB_PATH)
-
         stats = {
-            "total_mesures":   conn.execute("SELECT COUNT(*) FROM sensor_data").fetchone()[0],
-            "taux_occupation": conn.execute("SELECT ROUND(AVG(occupe)*100,1) FROM sensor_data").fetchone()[0] or 0,
-            "total_badges":    conn.execute("SELECT COUNT(*) FROM profils").fetchone()[0],
-            "badges_reguliers":conn.execute("SELECT COUNT(*) FROM profils WHERE label='regulier'").fetchone()[0],
-            "badges_nouveaux": conn.execute("SELECT COUNT(*) FROM profils WHERE label='nouveau'").fetchone()[0],
-            "total_passages":  conn.execute("SELECT COUNT(*) FROM rfid_events").fetchone()[0],
+            "total_mesures":    conn.execute("SELECT COUNT(*) FROM sensor_data").fetchone()[0],
+            "taux_occupation":  conn.execute("SELECT ROUND(AVG(occupe)*100,1) FROM sensor_data").fetchone()[0] or 0,
+            "total_badges":     conn.execute("SELECT COUNT(*) FROM profils").fetchone()[0],
+            "badges_reguliers": conn.execute("SELECT COUNT(*) FROM profils WHERE label='regulier'").fetchone()[0],
+            "badges_nouveaux":  conn.execute("SELECT COUNT(*) FROM profils WHERE label='nouveau'").fetchone()[0],
+            "total_passages":   conn.execute("SELECT COUNT(*) FROM rfid_events").fetchone()[0],
             "occupation_par_heure": [
                 {"heure": r[0], "taux": round(r[1]*100, 1)}
                 for r in conn.execute(
@@ -187,6 +198,34 @@ def api_stats():
         }
         conn.close()
         return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/predictions")
+def api_predictions():
+    try:
+        model_path = os.path.join(MODEL_DIR, "model_prediction.pkl")
+        if not os.path.exists(model_path):
+            return jsonify({"predictions": []})
+        model = joblib.load(model_path)
+        now   = datetime.now()
+        preds = []
+        for dh in range(12):
+            h = (now.hour + dh) % 24
+            j = (now.weekday() + (now.hour + dh) // 24) % 7
+            row = pd.DataFrame([{
+                "heure_sin":    np.sin(2 * np.pi * h / 24),
+                "heure_cos":    np.cos(2 * np.pi * h / 24),
+                "jour_sin":     np.sin(2 * np.pi * j / 7),
+                "jour_cos":     np.cos(2 * np.pi * j / 7),
+                "est_weekend":  1 if j >= 5 else 0,
+                "heure_pointe": 1 if h in [8, 9, 12, 13, 17, 18] else 0,
+                "minute":       now.minute,
+            }])
+            proba = model.predict_proba(row)[0][1]
+            preds.append({"heure": h, "prob_occupe": round(float(proba), 3)})
+        return jsonify({"predictions": preds, "timestamp": now.isoformat()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

@@ -9,7 +9,6 @@ import signal
 import sys
 import os
 from datetime import datetime
-from collections import defaultdict
 
 import paho.mqtt.client as mqtt
 
@@ -40,7 +39,6 @@ profil_cache = {}
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
-
     c.execute("""CREATE TABLE IF NOT EXISTS sensor_data (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp     TEXT,
@@ -51,7 +49,6 @@ def init_db():
         occupe        INTEGER,
         porte_ouverte INTEGER
     )""")
-
     c.execute("""CREATE TABLE IF NOT EXISTS rfid_events (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp     TEXT,
@@ -61,18 +58,16 @@ def init_db():
         jour_semaine  INTEGER,
         porte_ouverte INTEGER
     )""")
-
     c.execute("""CREATE TABLE IF NOT EXISTS profils (
-        uid              TEXT PRIMARY KEY,
-        premiere_visite  TEXT,
-        derniere_visite  TEXT,
-        nb_visites       INTEGER DEFAULT 0,
+        uid               TEXT PRIMARY KEY,
+        premiere_visite   TEXT,
+        derniere_visite   TEXT,
+        nb_visites        INTEGER DEFAULT 0,
         heures_frequentes TEXT,
         jours_frequents   TEXT,
         label             TEXT DEFAULT 'inconnu',
         card_type         TEXT
     )""")
-
     c.execute("""CREATE TABLE IF NOT EXISTS alertes (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp   TEXT,
@@ -80,7 +75,6 @@ def init_db():
         description TEXT,
         uid         TEXT
     )""")
-
     conn.commit()
     conn.close()
     log.info("Base de données initialisée.")
@@ -89,25 +83,19 @@ def init_db():
 def profiler_badge(uid: str, card_type: str, now: datetime) -> dict:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-
-    row = conn.execute(
-        "SELECT * FROM profils WHERE uid = ?", (uid,)
-    ).fetchone()
-
+    row = conn.execute("SELECT * FROM profils WHERE uid = ?", (uid,)).fetchone()
     heure = now.hour
     jour  = now.weekday()
 
     if row is None:
         heures = json.dumps({str(heure): 1})
         jours  = json.dumps({str(jour): 1})
-
         conn.execute("""
             INSERT INTO profils
             (uid, premiere_visite, derniere_visite, nb_visites,
              heures_frequentes, jours_frequents, label, card_type)
             VALUES (?,?,?,1,?,?,'nouveau',?)
         """, (uid, now.isoformat(), now.isoformat(), heures, jours, card_type))
-
         profil = {
             "uid": uid, "nb_visites": 1, "label": "nouveau",
             "premiere_visite": now.isoformat(),
@@ -117,23 +105,18 @@ def profiler_badge(uid: str, card_type: str, now: datetime) -> dict:
             "card_type": card_type
         }
         log.info("Nouveau badge enregistré : %s", uid)
-
     else:
         heures = json.loads(row["heures_frequentes"] or "{}")
         jours  = json.loads(row["jours_frequents"]   or "{}")
-
         heures[str(heure)] = heures.get(str(heure), 0) + 1
         jours[str(jour)]   = jours.get(str(jour), 0) + 1
-
         nb = row["nb_visites"] + 1
-
         if nb >= 10:
             label = "regulier"
         elif nb >= 3:
             label = "occasionnel"
         else:
             label = "nouveau"
-
         conn.execute("""
             UPDATE profils SET
                 derniere_visite   = ?,
@@ -143,27 +126,21 @@ def profiler_badge(uid: str, card_type: str, now: datetime) -> dict:
                 label             = ?,
                 card_type         = ?
             WHERE uid = ?
-        """, (
-            now.isoformat(), nb,
-            json.dumps(heures), json.dumps(jours),
-            label, card_type, uid
-        ))
-
+        """, (now.isoformat(), nb, json.dumps(heures), json.dumps(jours), label, card_type, uid))
         profil = {
-            "uid":              uid,
-            "nb_visites":       nb,
-            "label":            label,
-            "premiere_visite":  row["premiere_visite"],
-            "derniere_visite":  now.isoformat(),
+            "uid":               uid,
+            "nb_visites":        nb,
+            "label":             label,
+            "premiere_visite":   row["premiere_visite"],
+            "derniere_visite":   now.isoformat(),
             "heures_frequentes": heures,
             "jours_frequents":   jours,
-            "card_type":        card_type
+            "card_type":         card_type
         }
         log.info("Badge connu mis à jour : %s (label=%s, visites=%d)", uid, label, nb)
 
     conn.commit()
     conn.close()
-
     profil_cache[uid] = profil
     return profil
 
@@ -199,9 +176,7 @@ def sauvegarder_sensor(data, now):
 def get_tous_profils() -> list:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT * FROM profils ORDER BY nb_visites DESC"
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM profils ORDER BY nb_visites DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -241,25 +216,42 @@ def traiter_message(data: dict, client: mqtt.Client, ser: serial.Serial):
     elif msg_type == "rfid":
         uid       = data.get("uid", "")
         card_type = data.get("card_type", "")
+        place_libre = data.get("place_libre", True)
 
         profil = profiler_badge(uid, card_type, now)
 
-        sauvegarder_rfid_event(uid, card_type, now.hour, now.weekday(), True)
-
-        ser.write(b"OPEN\n")
-        log.info("Porte ouverte pour UID: %s (%s)", uid, profil["label"])
+        if not place_libre:
+            log.info("Place occupée — accès refusé pour UID: %s", uid)
+            ser.write(b"CLOSE\n")
+            sauvegarder_rfid_event(uid, card_type, now.hour, now.weekday(), False)
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("""
+                INSERT INTO alertes (timestamp, type_alerte, description, uid)
+                VALUES (?,?,?,?)
+            """, (now.isoformat(), "refus_place_pleine",
+                  f"Badge {uid} refusé — place occupée", uid))
+            conn.commit()
+            conn.close()
+            client.publish("parking/alerte", json.dumps({
+                "type": "warning",
+                "message": f"Badge {uid} refusé — place occupée",
+                "timestamp": now.isoformat(),
+            }))
+        else:
+            ser.write(b"OPEN\n")
+            log.info("Porte ouverte pour UID: %s (%s)", uid, profil["label"])
+            sauvegarder_rfid_event(uid, card_type, now.hour, now.weekday(), True)
 
         payload = {
-            "timestamp": now.isoformat(),
-            "uid":       uid,
-            "card_type": card_type,
-            "profil":    profil,
+            "timestamp":  now.isoformat(),
+            "uid":        uid,
+            "card_type":  card_type,
+            "profil":     profil,
+            "place_libre": place_libre,
         }
         client.publish("parking/rfid",   json.dumps(data))
         client.publish("parking/profil", json.dumps(payload))
-
-        tous = get_tous_profils()
-        client.publish("parking/profils_all", json.dumps(tous))
+        client.publish("parking/profils_all", json.dumps(get_tous_profils()))
 
     elif msg_type == "porte":
         client.publish("parking/porte", json.dumps(data))

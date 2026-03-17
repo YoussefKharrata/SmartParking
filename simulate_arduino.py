@@ -3,7 +3,6 @@
 import json
 import time
 import random
-import threading
 import sys
 from datetime import datetime
 import paho.mqtt.client as mqtt
@@ -11,8 +10,21 @@ import paho.mqtt.client as mqtt
 MQTT_BROKER = "localhost"
 MQTT_PORT   = 1883
 
+def on_commande(client, userdata, msg):
+    try:
+        data = json.loads(msg.payload.decode())
+        cmd  = data.get("commande", "")
+        if cmd == "OPEN":
+            send_porte("ouverte")
+        elif cmd == "CLOSE":
+            send_porte("fermee")
+    except Exception:
+        pass
+
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+client.on_message = on_commande
 client.connect(MQTT_BROKER, MQTT_PORT)
+client.subscribe("parking/commande")
 client.loop_start()
 
 RFID_CARDS = [
@@ -99,6 +111,19 @@ def send_rfid(uid=None, card_type=None):
         for u, v in RFID_VISIT_COUNTS.items()
     ))
 
+    if place_occupee:
+        pub("parking/alerte", {
+            "type":      "warning",
+            "message":   f"Badge {uid} refusé — place occupée",
+            "timestamp": now.isoformat(),
+        })
+        print(f"  !! Refus enregistré pour {uid}")
+    else:
+        time.sleep(0.3)
+        send_porte("ouverte")
+        time.sleep(2)
+        send_porte("fermee")
+
 
 def send_porte(etat):
     pub("parking/porte", {
@@ -123,10 +148,6 @@ def auto_loop():
 
         if random.random() < 0.15:
             send_rfid()
-            time.sleep(0.3)
-            send_porte("ouverte")
-            time.sleep(2)
-            send_porte("fermee")
 
         if random.random() < 0.05:
             send_alerte("Occupation sans RFID détectée")
