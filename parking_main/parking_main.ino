@@ -16,7 +16,7 @@
 #define LED_OCCUPE 7
 
 const uint8_t TRIG_PINS[NB_PLACES] = {A0, A1, A2, A3, A4, 9};
-const uint8_t ECHO_PINS[NB_PLACES] = {2,  4,  7,  8,  A5, 9};
+const uint8_t ECHO_PINS[NB_PLACES] = {2,  4,  7,  8,  A5, 6};
 
 MFRC522 rfid(SS_PIN, RST_PIN);
 Servo   servoPorte;
