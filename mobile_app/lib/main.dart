@@ -6,7 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 // Remplacer par l'adresse IP du serveur Raspberry Pi / PC sur le réseau local
-const String kServerUrl = 'http://192.168.1.100:5000';
+const String kServerUrl = 'http://10.1.153.155:5000';
 
 void main() {
   runApp(const SmartParkingApp());
