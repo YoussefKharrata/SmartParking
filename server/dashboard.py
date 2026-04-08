@@ -14,6 +14,11 @@ from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
 import paho.mqtt.client as mqtt
 from config import NB_PLACES, MQTT_BROKER, MQTT_PORT
+from reservations import (
+    init_reservation_tables,
+    get_places_reservees_maintenant,
+    reservations_bp,
+)
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 DB_PATH   = os.path.join(BASE_DIR, "data", "parking.db")
@@ -23,14 +28,18 @@ app      = Flask(__name__, template_folder="templates")
 app.config["SECRET_KEY"] = "parking-iot-2025"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
+app.register_blueprint(reservations_bp)
+init_reservation_tables()
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 etat = {
-    "places":        {str(i): {"occupe": False, "distance": 0, "porte_ouverte": False} for i in range(1, NB_PLACES + 1)},
+    "places":        {str(i): {"occupe": False, "distance": 0, "porte_ouverte": False, "reservee": False} for i in range(1, NB_PLACES + 1)},
     "nb_places":     NB_PLACES,
     "nb_libres":     NB_PLACES,
     "nb_occupees":   0,
+    "nb_reservees":  0,
     "derniere_maj":  "",
     "mqtt_ok":       False,
     "arduino_ok":    False,
@@ -41,8 +50,16 @@ etat = {
 
 
 def recalc_globaux():
-    etat["nb_occupees"] = sum(1 for p in etat["places"].values() if p["occupe"])
-    etat["nb_libres"]   = NB_PLACES - etat["nb_occupees"]
+    # Mettre à jour les places réservées depuis la DB
+    places_reservees = get_places_reservees_maintenant()
+    for pid_str, place in etat["places"].items():
+        place["reservee"] = int(pid_str) in places_reservees
+
+    etat["nb_occupees"]  = sum(1 for p in etat["places"].values() if p["occupe"])
+    etat["nb_reservees"] = sum(1 for p in etat["places"].values() if p["reservee"] and not p["occupe"])
+    etat["nb_libres"]    = NB_PLACES - etat["nb_occupees"] - etat["nb_reservees"]
+    if etat["nb_libres"] < 0:
+        etat["nb_libres"] = 0
 
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties):
@@ -70,8 +87,10 @@ def on_mqtt_message(client, userdata, msg):
                 "place_id": data.get("place_id", 1),
                 "occupe":   data.get("occupe", False),
                 "distance": data.get("distance", 0),
-                "nb_libres":   etat["nb_libres"],
-                "nb_occupees": etat["nb_occupees"],
+                "reservee": etat["places"][str(data.get("place_id", 1))].get("reservee", False),
+                "nb_libres":    etat["nb_libres"],
+                "nb_occupees":  etat["nb_occupees"],
+                "nb_reservees": etat["nb_reservees"],
                 "derniere_maj": etat["derniere_maj"],
             })
 
@@ -126,6 +145,11 @@ except Exception as e:
 @app.route("/")
 def index():
     return render_template("dashboard.html")
+
+
+@app.route("/admin/reservations")
+def admin_reservations():
+    return render_template("admin_reservations.html")
 
 
 @app.route("/api/etat")

@@ -12,6 +12,7 @@ from datetime import datetime
 
 import paho.mqtt.client as mqtt
 from config import NB_PLACES, MQTT_BROKER, MQTT_PORT, SERIAL_PORT, SERIAL_BAUD
+from reservations import init_reservation_tables, get_places_reservees_maintenant
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH  = os.path.join(BASE_DIR, "data", "parking.db")
@@ -75,6 +76,7 @@ def init_db():
     )""")
     conn.commit()
     conn.close()
+    init_reservation_tables()
     log.info("Base de données initialisée.")
 
 

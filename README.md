@@ -1,6 +1,6 @@
 # SmartParking — Système de parking intelligent IoT
 
-Projet de fin d'études réalisé sur Raspberry Pi 4 et Arduino Uno. Le système détecte en temps réel l'occupation d'une place de parking via un capteur ultrasonique HC-SR04, contrôle l'accès par badge RFID (MFRC522), et ouvre une barrière motorisée (servo SG90) uniquement si la place est libre. Chaque badge est profilé automatiquement au fil du temps (fréquence de visite, horaires habituels, classification). Un module de Machine Learning prédit l'occupation sur les 12 prochaines heures et détecte les comportements de badges anormaux. Tout est supervisé via un dashboard web temps réel accessible depuis n'importe quel appareil sur le réseau local.
+Projet d'IoT réalisé sur Raspberry Pi 4 et Arduino Uno. Le système détecte en temps réel l'occupation d'une place de parking via un capteur ultrasonique HC-SR04, contrôle l'accès par badge RFID (MFRC522), et ouvre une barrière motorisée (servo SG90) uniquement si la place est libre. Chaque badge est profilé automatiquement au fil du temps (fréquence de visite, horaires habituels, classification). Un module de Machine Learning prédit l'occupation sur les 12 prochaines heures et détecte les comportements de badges anormaux. Tout est supervisé via un dashboard web temps réel accessible depuis n'importe quel appareil sur le réseau local.
 
 ### Membres
 
